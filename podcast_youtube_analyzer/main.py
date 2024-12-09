@@ -1,11 +1,15 @@
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from pathlib import Path
 import json
 from datetime import datetime
 import ollama
+import gradio as gr
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import re
 
 # Configure logging
 logging.basicConfig(
@@ -21,6 +25,41 @@ class TranscriptSegment:
     text: str
     start: float
     duration: float
+    embedding: Optional[np.ndarray] = None
+
+
+class TranscriptMemory:
+    """Manages transcript segments and their embeddings for retrieval."""
+
+    def __init__(self):
+        self.encoder = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+        self.segments: List[TranscriptSegment] = []
+        self.embeddings: Optional[np.ndarray] = None
+
+    def add_segments(self, segments: List[TranscriptSegment]):
+        """Add segments and compute their embeddings."""
+        self.segments = segments
+        texts = [segment.text for segment in segments]
+        self.embeddings = self.encoder.encode(texts, convert_to_tensor=True)
+
+    def get_relevant_context(self, query: str, top_k: int = 3) -> str:
+        """Retrieve most relevant segments for a query."""
+        if not self.segments or self.embeddings is None:
+            return ""
+
+        # Convert embeddings to CPU numpy arrays
+        embeddings_cpu = self.embeddings.cpu().numpy()
+
+        # Encode the query and move it to CPU
+        query_embedding = self.encoder.encode(query, convert_to_tensor=True).cpu().numpy()
+
+        # Compute similarities
+        similarities = np.dot(embeddings_cpu, query_embedding)
+        top_indices = np.argsort(similarities)[-top_k:][::-1]
+
+        # Construct context from top matches
+        context_segments = [self.segments[i].text for i in top_indices]
+        return " ".join(context_segments)
 
 
 class PodcastTranscriptProcessor:
@@ -34,17 +73,12 @@ class PodcastTranscriptProcessor:
         self.model_name = model_name
         self.output_dir = Path("transcripts")
         self.output_dir.mkdir(exist_ok=True)
+        self.memory = TranscriptMemory()
+        self.current_video_id: Optional[str] = None
+        self.chat_history: List[Tuple[str, str]] = []
 
     def extract_video_id(self, url: str) -> str:
-        """
-        Extract YouTube video ID from URL.
-
-        Args:
-            url: YouTube video URL
-
-        Returns:
-            str: Video ID
-        """
+        """Extract YouTube video ID from URL."""
         if "youtu.be" in url:
             return url.split("/")[-1]
         elif "youtube.com" in url:
@@ -53,15 +87,7 @@ class PodcastTranscriptProcessor:
         raise ValueError("Invalid YouTube URL format")
 
     def get_transcript(self, video_id: str) -> List[TranscriptSegment]:
-        """
-        Fetch transcript for a YouTube video.
-
-        Args:
-            video_id: YouTube video ID
-
-        Returns:
-            List[TranscriptSegment]: List of transcript segments
-        """
+        """Fetch transcript for a YouTube video."""
         try:
             transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
             return [
@@ -76,44 +102,29 @@ class PodcastTranscriptProcessor:
             logger.error(f"Failed to fetch transcript for video {video_id}: {str(e)}")
             raise
 
-    def create_markdown(self, segments: List[TranscriptSegment], video_id: str) -> str:
+    async def chat_with_transcript(self, user_message: str) -> str:
         """
-        Convert transcript segments to markdown format.
+        Chat with the transcript using RAG.
 
         Args:
-            segments: List of transcript segments
-            video_id: YouTube video ID
+            user_message: User's question or message
 
         Returns:
-            str: Markdown formatted text
+            str: AI response
         """
-        markdown_content = f"# Transcript for YouTube Video: {video_id}\n\n"
-        markdown_content += f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        # Get relevant context
+        context = self.memory.get_relevant_context(user_message)
 
-        for segment in segments:
-            # timestamp = f"{int(segment.start // 60)}:{int(segment.start % 60):02d}"
-            markdown_content = f"{segment.text}\n\n"
+        print("context",context)
 
-        return markdown_content
+        # Construct prompt
+        prompt = f"""Based on the following context from a podcast transcript, please answer the question.
+        If the answer cannot be found in the context, say so.
 
-    async def summarize_transcript(self, text: str) -> str:
-        """
-        Summarize transcript using Ollama.
+        Context:
+        {context}
 
-        Args:
-            text: Full transcript text
-
-        Returns:
-            str: Summarized text
-        """
-        prompt = f"""Please summarize the following podcast transcript, focusing on:
-        1. Main topics discussed
-        2. Key insights and takeaways
-        3. Important quotes or statements
-
-        Transcript:
-        {text}
-        """
+        Question: {user_message}"""
 
         try:
             response = ollama.chat(
@@ -122,70 +133,66 @@ class PodcastTranscriptProcessor:
             )
             return response['message']['content']
         except Exception as e:
-            logger.error(f"Failed to generate summary: {str(e)}")
-            raise
+            logger.error(f"Failed to generate response: {str(e)}")
+            return f"Error generating response: {str(e)}"
 
-    def save_outputs(self, video_id: str, markdown: str, summary: str):
-        """
-        Save markdown and summary to files.
-
-        Args:
-            video_id: YouTube video ID
-            markdown: Markdown formatted transcript
-            summary: Generated summary
-        """
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-
-        # Save markdown
-        markdown_path = self.output_dir / f"{video_id}_{timestamp}_transcript.md"
-        markdown_path.write_text(markdown)
-
-        # Save summary
-        summary_path = self.output_dir / f"{video_id}_{timestamp}_summary.md"
-        summary_path.write_text(summary)
-
-        logger.info(f"Saved transcript and summary for video {video_id}")
-
-    async def process_video(self, video_url: str):
-        """
-        Process a YouTube video: extract transcript, create markdown, and generate summary.
-
-        Args:
-            video_url: YouTube video URL
-        """
+    async def process_video_url(self, url: str) -> str:
+        """Process a new video URL and prepare it for chatting."""
         try:
-            video_id = self.extract_video_id(video_url)
-            logger.info(f"Processing video: {video_id}")
+            video_id = self.extract_video_id(url)
+            if video_id == self.current_video_id:
+                return "This video is already loaded!"
 
-            # Get transcript
             segments = self.get_transcript(video_id)
+            self.memory.add_segments(segments)
+            self.current_video_id = video_id
+            self.chat_history = []
 
-            # Create markdown
-            markdown = self.create_markdown(segments, video_id)
-
-            # Generate summary
-            summary = await self.summarize_transcript(
-                " ".join(segment.text for segment in segments)
-            )
-
-            # Save outputs
-            self.save_outputs(video_id, markdown, summary)
-
-            logger.info(f"Successfully processed video: {video_id}")
+            return f"Successfully loaded transcript for video {video_id}. You can now ask questions about the content!"
 
         except Exception as e:
-            logger.error(f"Failed to process video {video_url}: {str(e)}")
-            raise
+            logger.error(f"Error processing video: {str(e)}")
+            return f"Error processing video: {str(e)}"
+
+    def create_gradio_interface(self):
+        """Create and launch the Gradio interface."""
+        with gr.Blocks(title="Podcast Transcript Chat") as interface:
+            gr.Markdown("# Podcast Transcript Chat")
+            gr.Markdown("Enter a YouTube URL to load its transcript, then chat about the content!")
+
+            with gr.Row():
+                url_input = gr.Textbox(label="YouTube URL")
+                load_btn = gr.Button("Load Transcript")
+
+            status_output = gr.Markdown()
+
+            chatbot = gr.Chatbot(label="Chat History")
+            msg_input = gr.Textbox(label="Your Message", placeholder="Ask about the podcast content...")
+            send_btn = gr.Button("Send")
+
+            async def respond(user_message, history):
+                if not self.current_video_id:
+                    return history + [(user_message, "Please load a video transcript first!")]
+
+                bot_response = await self.chat_with_transcript(user_message)
+                history.append((user_message, bot_response))
+                return history
+
+            async def load_video(url):
+                return await self.process_video_url(url)
+
+            load_btn.click(load_video, inputs=[url_input], outputs=[status_output])
+            msg_input.submit(respond, inputs=[msg_input, chatbot], outputs=[chatbot])
+            send_btn.click(respond, inputs=[msg_input, chatbot], outputs=[chatbot])
+
+        return interface
 
 
-async def main():
-    # Example usage
+def main():
     processor = PodcastTranscriptProcessor()
-    video_url = "https://www.youtube.com/watch?v=pAcF3GV4ygM&t=1263s"
-    await processor.process_video(video_url)
+    interface = processor.create_gradio_interface()
+    interface.launch(share=True)
 
 
 if __name__ == "__main__":
-    import asyncio
-
-    asyncio.run(main())
+    main()
